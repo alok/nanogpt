@@ -1,4 +1,8 @@
 # %%
+from einops import einsum, pack, unpack
+from einops import rearrange, reduce, repeat
+from einops.layers.torch import Rearrange, Reduce
+
 import itertools
 import random
 import string
@@ -11,7 +15,12 @@ import torch
 from typing import Literal
 import bidict
 from torch import nn
+from torch import Tensor as T, LongTensor as LT
 import torch.nn.functional as F
+from jaxtyping import Float, Integer
+
+# HACK: jaxtyping doesn't like longtensor, so reassign to plain tensor
+LT = T
 
 INPUT_FILE = Path("input.txt")
 data = urllib.request.urlretrieve(
@@ -38,8 +47,8 @@ def encode(s: str) -> list[int]:
 
 
 # %%
-def decode(l: list[int] | list[torch.LongTensor]) -> str:
-    if isinstance(l, torch.LongTensor) or isinstance(l[0], torch.LongTensor):
+def decode(l: list[int] | list[LT]) -> str:
+    if isinstance(l, LT) or isinstance(l[0], LT):
         return "".join([VOCAB[i.item()] for i in l])
     else:
         return "".join([VOCAB[i] for i in l])
@@ -97,12 +106,30 @@ for b, t in itertools.product(range(BATCH_SIZE), range(CTX_LEN)):
 class Bigram(nn.Module):
     def __init__(self, vocab_size: int) -> None:
         super().__init__()
-        self.token_embeddings = nn.Embedding(vocab_size, vocab_size)
-        print(self.token_embeddings)
+        self.token_embeddings = nn.Embedding(
+            num_embeddings=vocab_size, embedding_dim=vocab_size
+        )
+        # this can represent a bigram model since the 2d matrix gives "probability of col given row"
 
-    def forward(self, args: Tensor) -> Tensor:
-        ...
+    def forward(self, idx: Integer[LT, "seq"], targets: Integer[LT, "seq"]):
+        logits: Float[T, "seq embed"] = rearrange(
+            self.token_embeddings(idx), "seq embed -> embed seq"
+        )
+        loss = F.cross_entropy(logits, targets)
+        return logits, loss
 
 
 bigram = Bigram(vocab_size=len(chars))
+# %% shape experiment
+bigram(torch.tensor(1)).shape
+# %%
+Bigram(2)(torch.tensor([0, 1]))
+# Tensor(vocabsize)
+# Bigram()# error
+
+# %%
+assert bigram.token_embeddings.parameters().__next__() == (len(chars), len(chars))
+# %%
+bigram(xb, yb)
+
 # %%

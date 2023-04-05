@@ -11,6 +11,8 @@ torch = "^2.0.0"
 einops = "^0.6.0"
 bidict = "^0.22.1"
 
+jaxtyping = "^0.2.14"
+
 
 [tool.poetry.group.dev.dependencies]
 black = "^23.3.0"
