@@ -1,11 +1,17 @@
 # %%
+import itertools
 import random
 import string
 from typing import Final
 from pathlib import Path
+from torch import Tensor
+from torch import vmap, jit
 import urllib.request
 import torch
+from typing import Literal
 import bidict
+from torch import nn
+import torch.nn.functional as F
 
 INPUT_FILE = Path("input.txt")
 data = urllib.request.urlretrieve(
@@ -32,8 +38,11 @@ def encode(s: str) -> list[int]:
 
 
 # %%
-def decode(l: list[int]) -> str:
-    return "".join([VOCAB[i] for i in l])
+def decode(l: list[int] | list[torch.LongTensor]) -> str:
+    if isinstance(l, torch.LongTensor) or isinstance(l[0], torch.LongTensor):
+        return "".join([VOCAB[i.item()] for i in l])
+    else:
+        return "".join([VOCAB[i] for i in l])
 
 
 # %%
@@ -47,10 +56,53 @@ data = torch.tensor(encode(raw_data), dtype=torch.long)  #
 
 
 # %% Split into train and test sets
-# rolling lookback
 
-WINDOW_SIZE: int = 5  # v important that constants be in SCREAMING_SNAKE_CASE
-random.seed
+CTX_LEN: int = 8  # v important that constants be in SCREAMING_SNAKE_CASE
+# random.seed(48)
 
-split = 0.9 * len(data)
+split = int(0.9 * len(data))
 train, val = data[:split], data[split:]
+
+# %%
+x, y = train[:CTX_LEN], train[1 : CTX_LEN + 1]
+
+# We use different
+for t in range(CTX_LEN):
+    input, target = x[: t + 1], y[t]  # y[t] = x[t+1]
+    print(input, target)
+    # print(decode(input), decode(target))
+
+# %%
+random.seed(1337)
+torch.manual_seed(1337)
+
+BATCH_SIZE: int = 4
+
+
+# %%
+def get_batch(mode: Literal["train", "val"]) -> tuple[Tensor, Tensor]:
+    data = train if mode == "train" else val
+    random_idxs = torch.randint(high=len(data) - CTX_LEN, size=(BATCH_SIZE,))
+    inputs = torch.stack([data[i : i + CTX_LEN] for i in random_idxs])
+    outputs = torch.stack([data[i + 1 : i + 1 + CTX_LEN] for i in random_idxs])
+    return inputs, outputs
+
+
+xb, yb = get_batch("train")
+for b, t in itertools.product(range(BATCH_SIZE), range(CTX_LEN)):
+    ctx, tgt = xb[b, : t + 1], yb[b, t]
+
+
+# %% bigram language model
+class Bigram(nn.Module):
+    def __init__(self, vocab_size: int) -> None:
+        super().__init__()
+        self.token_embeddings = nn.Embedding(vocab_size, vocab_size)
+        print(self.token_embeddings)
+
+    def forward(self, args: Tensor) -> Tensor:
+        ...
+
+
+bigram = Bigram(vocab_size=len(chars))
+# %%
