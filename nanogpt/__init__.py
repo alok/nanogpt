@@ -111,25 +111,39 @@ class Bigram(nn.Module):
         )
         # this can represent a bigram model since the 2d matrix gives "probability of col given row"
 
-    def forward(self, idx: Integer[LT, "seq"], targets: Integer[LT, "seq"]):
-        logits: Float[T, "seq embed"] = rearrange(
-            self.token_embeddings(idx), "seq embed -> embed seq"
+    def forward(
+        self, idx: Integer[LT, "b seq"], targets: Integer[LT, "b seq"] | None
+    ) -> tuple[Tensor, Tensor | None]:
+        logits: Float[T, "b embed seq"] = rearrange(
+            self.token_embeddings(idx), "b seq embed -> b embed seq"
         )
-        loss = F.cross_entropy(logits, targets)
+        if targets is None:
+            loss = None
+        else:
+            loss = F.cross_entropy(logits, targets)
         return logits, loss
+
+    def generate(
+        self, idx: Integer[LT, "b seq"], max_new_toks: int
+    ) -> Integer[LT, "b seq+max_new_toks"]:
+        for _ in range(max_new_toks):
+            logits, loss = self(idx)
+            logits = logits[:, -1, :]
+            probs = logits.softmax(dim=-1)
+            next_idx = probs.multinomial(num_samples=1)
+            logits = torch.cat([logits, next_idx])
+        return logits
 
 
 bigram = Bigram(vocab_size=len(chars))
 # %% shape experiment
-bigram(torch.tensor(1)).shape
-# %%
-Bigram(2)(torch.tensor([0, 1]))
-# Tensor(vocabsize)
-# Bigram()# error
+# bigram(torch.tensor(1)).shape
+
 
 # %%
 assert bigram.token_embeddings.parameters().__next__() == (len(chars), len(chars))
 # %%
 bigram(xb, yb)
 
+bigram.generate()
 # %%
