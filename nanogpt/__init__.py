@@ -19,9 +19,12 @@ from torch import Tensor as T, LongTensor as LT
 import torch.nn.functional as F
 from jaxtyping import Float, Integer
 
+random.seed(1337)
+torch.manual_seed(1337)
+
 # HACK: jaxtyping doesn't like longtensor, so reassign to plain tensor
 LT = T
-
+BATCH_SIZE: int = 32
 INPUT_FILE = Path("input.txt")
 data = urllib.request.urlretrieve(
     url="https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt",
@@ -31,6 +34,8 @@ raw_data = INPUT_FILE.read_text()
 
 chars = sorted(set(raw_data))
 text = "".join(chars)
+
+
 # %% Tokenization
 
 
@@ -67,7 +72,6 @@ data = torch.tensor(encode(raw_data), dtype=torch.long)  #
 # %% Split into train and test sets
 
 CTX_LEN: int = 8  # v important that constants be in SCREAMING_SNAKE_CASE
-# random.seed(48)
 
 split = int(0.9 * len(data))
 train, val = data[:split], data[split:]
@@ -82,18 +86,18 @@ for t in range(CTX_LEN):
     # print(decode(input), decode(target))
 
 # %%
-random.seed(1337)
-torch.manual_seed(1337)
-
-BATCH_SIZE: int = 4
 
 
 # %%
 def get_batch(mode: Literal["train", "val"]) -> tuple[Tensor, Tensor]:
     data = train if mode == "train" else val
     random_idxs = torch.randint(high=len(data) - CTX_LEN, size=(BATCH_SIZE,))
-    inputs = torch.stack([data[i : i + CTX_LEN] for i in random_idxs])
-    outputs = torch.stack([data[i + 1 : i + 1 + CTX_LEN] for i in random_idxs])
+    inputs: Integer[LT, "b ctx_len"] = torch.stack(
+        [data[i : i + CTX_LEN] for i in random_idxs]
+    )
+    outputs: Integer[LT, "b ctx_len"] = torch.stack(
+        [data[i + 1 : i + 1 + CTX_LEN] for i in random_idxs]
+    )
     return inputs, outputs
 
 
@@ -112,10 +116,13 @@ class Bigram(nn.Module):
         # this can represent a bigram model since the 2d matrix gives "probability of col given row"
 
     def forward(
-        self, idx: Integer[LT, "b seq"], targets: Integer[LT, "b seq"] | None
+        self, idxs: Integer[LT, "b seq"], targets: Integer[LT, "b seq"] | None = None
     ) -> tuple[Tensor, Tensor | None]:
+        """
+        idxs: batch of indexes to represent a sentence.
+        """
         logits: Float[T, "b embed seq"] = rearrange(
-            self.token_embeddings(idx), "b seq embed -> b embed seq"
+            self.token_embeddings(idxs), "b seq embed -> b embed seq"
         )
         if targets is None:
             loss = None
@@ -124,15 +131,17 @@ class Bigram(nn.Module):
         return logits, loss
 
     def generate(
-        self, idx: Integer[LT, "b seq"], max_new_toks: int
+        self, idxs: Integer[LT, "b seq"], max_new_toks: int
     ) -> Integer[LT, "b seq+max_new_toks"]:
-        for _ in range(max_new_toks):
-            logits, loss = self(idx)
-            logits = logits[:, -1, :]
-            probs = logits.softmax(dim=-1)
-            next_idx = probs.multinomial(num_samples=1)
-            logits = torch.cat([logits, next_idx])
-        return logits
+        for i in range(max_new_toks):
+            logits: Integer[LT, "b embed seq"]
+            logits, loss = self(idxs)
+            logits: Integer[LT, "b embed"] = logits[:, :, -1]
+            probs: Integer[LT, "b embed"] = logits.softmax(dim=-1)
+            next_idx: Integer[LT, "b 1"] = probs.multinomial(num_samples=1)
+            idxs: Integer[LT, "b i+1"] = torch.cat([idxs, next_idx], dim=1)
+
+        return idxs
 
 
 bigram = Bigram(vocab_size=len(chars))
@@ -141,9 +150,31 @@ bigram = Bigram(vocab_size=len(chars))
 
 
 # %%
-assert bigram.token_embeddings.parameters().__next__() == (len(chars), len(chars))
+assert next(bigram.token_embeddings.parameters()).shape == (
+    len(chars),
+    len(chars),
+)
 # %%
 bigram(xb, yb)
 
-bigram.generate()
+bigram.generate(idxs=torch.zeros((1, 1)).long(), max_new_toks=10)
+# %%
+optimizer = torch.optim.AdamW(
+    bigram.parameters(), lr=1e-3
+)  # TODO test out 1e-2,1e-3, 3e-4
+
+
+# training: call on batches
+for epoch in range(1000):
+    xb, yb = get_batch("train")
+
+    logits, loss = bigram(idxs=xb, targets=yb)
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+print(loss.item())
+
+# %%
+print(decode(bigram.generate(idxs=torch.zeros((1, 1)).long(), max_new_toks=100)[0]))
+
 # %%
