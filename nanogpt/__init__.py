@@ -2,12 +2,14 @@
 from einops import einsum, pack, unpack
 from einops import rearrange, reduce, repeat
 from einops.layers.torch import Rearrange, Reduce
-
+import torch
 import itertools
 import random
 import string
 from typing import Final
 from pathlib import Path
+import math
+import statistics
 from torch import Tensor
 from torch import vmap, jit
 import urllib.request
@@ -165,7 +167,7 @@ optimizer = torch.optim.AdamW(
 
 
 # training: call on batches
-for epoch in range(1000):
+for epoch in range(10_000):
     xb, yb = get_batch("train")
 
     logits, loss = bigram(idxs=xb, targets=yb)
@@ -176,5 +178,37 @@ print(loss.item())
 
 # %%
 print(decode(bigram.generate(idxs=torch.zeros((1, 1)).long(), max_new_toks=100)[0]))
+
+
+# %%
+def estimate_loss(model):
+    metrics = {"train": [], "val": []}
+
+    with torch.no_grad():
+        for split in ("train", "val"):
+            for iter in range(10_000):
+                xb, yb = get_batch(split)
+                logits, loss = model(xb, yb)
+                metrics[split].append(loss.item())
+            metrics[split] = statistics.mean(metrics[split])
+    return metrics
+
+
+# %%
+estimate_loss(bigram)
+# %%
+# the mathematical trick in self-attention
+
+torch.manual_seed(1_337)  # follow karpathy's seed for repro
+B, T, C = 8, 3, 2
+x = torch.randn(B, T, C)
+x_bow = torch.zeros(B, T, C)
+
+for b in range(B):
+    for t in range(T):
+        x_bow[b, t] = x[b, : t + 1].mean(dim=0)
+print(x_bow.shape)
+mask = torch.full((T, T), float("-inf")).triu(diagonal=1)
+assert (mask @ x_bow).shape == (B, T, C)
 
 # %%
