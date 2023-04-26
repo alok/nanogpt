@@ -6,7 +6,7 @@ import torch
 import itertools
 import random
 import string
-from typing import Final
+from typing import Callable, Final
 from pathlib import Path
 import math
 import statistics
@@ -21,8 +21,8 @@ from torch import Tensor as T, LongTensor as LT
 import torch.nn.functional as F
 from jaxtyping import Float, Integer
 
-random.seed(1337)
-torch.manual_seed(1337)
+random.seed(1_337)
+torch.manual_seed(1_337)
 
 # HACK: jaxtyping doesn't like longtensor, so reassign to plain tensor
 LT = T
@@ -46,6 +46,8 @@ text = "".join(chars)
 # init codebook/vocab
 
 VOCAB: Final[bidict.bidict[int, str]] = bidict.bidict(enumerate(chars))
+VOCAB_SIZE: Final[int] = len(VOCAB)
+EMBED_DIM: Final[int] = 32
 
 
 # %%
@@ -87,8 +89,6 @@ for t in range(CTX_LEN):
     print(input, target)
     # print(decode(input), decode(target))
 
-# %%
-
 
 # %%
 def get_batch(mode: Literal["train", "val"]) -> tuple[Tensor, Tensor]:
@@ -110,11 +110,22 @@ for b, t in itertools.product(range(BATCH_SIZE), range(CTX_LEN)):
 
 # %% bigram language model
 class Bigram(nn.Module):
-    def __init__(self, vocab_size: int) -> None:
+    def __init__(
+        self, vocab_size: int = VOCAB_SIZE, embed_dim: int = EMBED_DIM
+    ) -> None:
         super().__init__()
         self.token_embeddings = nn.Embedding(
-            num_embeddings=vocab_size, embedding_dim=vocab_size
+            num_embeddings=vocab_size, embedding_dim=embed_dim
         )
+        self.pos_emb = nn.Embedding(CTX_LEN, embed_dim)
+        self.lang_head = nn.Linear(embed_dim, vocab_size)
+
+        self.model: Callable[[Integer[LT, "b seq"]], Float[T, "b seq"]] = nn.Sequential(
+            self.token_embeddings,
+            Rearrange("b seq embed -> b embed seq"),
+            self.lang_head,
+        )
+
         # this can represent a bigram model since the 2d matrix gives "probability of col given row"
 
     def forward(
@@ -123,9 +134,8 @@ class Bigram(nn.Module):
         """
         idxs: batch of indexes to represent a sentence.
         """
-        logits: Float[T, "b embed seq"] = rearrange(
-            self.token_embeddings(idxs), "b seq embed -> b embed seq"
-        )
+        logits: Float[T, "b seq"] = self.model(idxs)
+
         if targets is None:
             loss = None
         else:
@@ -200,7 +210,8 @@ estimate_loss(bigram)
 # the mathematical trick in self-attention
 
 torch.manual_seed(1_337)  # follow karpathy's seed for repro
-B, T, C = 8, 3, 2
+B, T, C = 8, 3, 32
+HEAD_SIZE: int = 16
 x = torch.randn(B, T, C)
 x_bow = torch.zeros(B, T, C)
 
@@ -211,4 +222,20 @@ print(x_bow.shape)
 mask = torch.full((T, T), float("-inf")).triu(diagonal=1)
 assert (mask @ x_bow).shape == (B, T, C)
 
+# %%
+# version 4: self attention
+
+key, query = nn.Linear(C, HEAD_SIZE, bias=False), nn.Linear(C, HEAD_SIZE, bias=False)
+k, q = key(x), query(x)  # B T H,  B T H
+weights = einsum(k, q, "b seq h, b seq2 h -> b seq seq2")  #: Float[T, "b seq seq"]
+
+
+def mask_out(x) :
+#    : Float[T, "b t t"]->Float[T, "b t t"]
+    _, T, _ = x.shape
+    return x.masked_fill(x.tril() == 0, float("-inf")).softmax(dim=-1)
+
+
+masked = mask_out(weights)
+assert torch.allclose(masked[0].sum(),torch.tensor(masked[0].shape[-1]).float())
 # %%
