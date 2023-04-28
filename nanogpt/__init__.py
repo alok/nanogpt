@@ -22,11 +22,22 @@ import torch.nn.functional as F
 from jaxtyping import Float, Integer
 
 random.seed(1_337)
-torch.manual_seed(1_337)
+torch.manual_seed(1_337) # follow karpathy's seed for repro
 
 # HACK: jaxtyping doesn't like longtensor, so reassign to plain tensor
 LT = T
-BATCH_SIZE: int = 32
+BATCH_SIZE: int = 16
+CTX_LEN: int = 8  # v important that constants be in SCREAMING_SNAKE_CASE
+
+B, T, C = BATCH_SIZE, CTX_LEN, 32 # batch time channel
+# time aka ctx_len aka seq
+HEAD_SIZE: int = 16
+
+EMBED_DIM: Final[int] = 32
+
+## I think error in bigram expects BATCH, CTX but gets BATCH, EMBEDDIM
+## New error F.cross_entropy expects BATCH, vocab and got BATCH, CTX_LEN
+
 INPUT_FILE = Path("input.txt")
 data = urllib.request.urlretrieve(
     url="https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt",
@@ -38,6 +49,7 @@ chars = sorted(set(raw_data))
 text = "".join(chars)
 
 
+
 # %% Tokenization
 
 
@@ -47,7 +59,7 @@ text = "".join(chars)
 
 VOCAB: Final[bidict.bidict[int, str]] = bidict.bidict(enumerate(chars))
 VOCAB_SIZE: Final[int] = len(VOCAB)
-EMBED_DIM: Final[int] = 32
+
 
 
 # %%
@@ -74,8 +86,6 @@ data = torch.tensor(encode(raw_data), dtype=torch.long)  #
 
 
 # %% Split into train and test sets
-
-CTX_LEN: int = 8  # v important that constants be in SCREAMING_SNAKE_CASE
 
 split = int(0.9 * len(data))
 train, val = data[:split], data[split:]
@@ -120,35 +130,35 @@ class Bigram(nn.Module):
         self.pos_emb = nn.Embedding(CTX_LEN, embed_dim)
         self.lang_head = nn.Linear(embed_dim, vocab_size)
 
-        self.model: Callable[[Integer[LT, "b seq"]], Float[T, "b seq"]] = nn.Sequential(
+        self.model: Callable[[Integer[LT, "b t"]], Float[T, "b t"]] = nn.Sequential(
             self.token_embeddings,
-            Rearrange("b seq embed -> b embed seq"),
+            # Rearrange("b t embed -> b embed t"),
             self.lang_head,
         )
 
         # this can represent a bigram model since the 2d matrix gives "probability of col given row"
 
     def forward(
-        self, idxs: Integer[LT, "b seq"], targets: Integer[LT, "b seq"] | None = None
+        self, idxs: Integer[LT, "b t"], targets: Integer[LT, "b t"] | None = None
     ) -> tuple[Tensor, Tensor | None]:
         """
         idxs: batch of indexes to represent a sentence.
         """
-        logits: Float[T, "b seq"] = self.model(idxs)
+        logits: Float[T, "b t"] = self.model(idxs)
 
         if targets is None:
             loss = None
         else:
-            loss = F.cross_entropy(logits, targets)
+            loss = F.cross_entropy(rearrange(logits, 'b t c -> (b t) c'), rearrange(targets, 'b t -> (b t)'))
         return logits, loss
 
     def generate(
-        self, idxs: Integer[LT, "b seq"], max_new_toks: int
-    ) -> Integer[LT, "b seq+max_new_toks"]:
+        self, idxs: Integer[LT, "b t"], max_new_toks: int
+    ) -> Integer[LT, "b t+max_new_toks"]:
         for i in range(max_new_toks):
-            logits: Integer[LT, "b embed seq"]
+            logits: Integer[LT, "b t embed"]
             logits, loss = self(idxs)
-            logits: Integer[LT, "b embed"] = logits[:, :, -1]
+            logits: Integer[LT, "b embed"] = logits[:, -1, :]
             probs: Integer[LT, "b embed"] = logits.softmax(dim=-1)
             next_idx: Integer[LT, "b 1"] = probs.multinomial(num_samples=1)
             idxs: Integer[LT, "b i+1"] = torch.cat([idxs, next_idx], dim=1)
@@ -157,15 +167,7 @@ class Bigram(nn.Module):
 
 
 bigram = Bigram(vocab_size=len(chars))
-# %% shape experiment
-# bigram(torch.tensor(1)).shape
 
-
-# %%
-assert next(bigram.token_embeddings.parameters()).shape == (
-    len(chars),
-    len(chars),
-)
 # %%
 bigram(xb, yb)
 
@@ -209,9 +211,6 @@ estimate_loss(bigram)
 # %%
 # the mathematical trick in self-attention
 
-torch.manual_seed(1_337)  # follow karpathy's seed for repro
-B, T, C = 8, 3, 32
-HEAD_SIZE: int = 16
 x = torch.randn(B, T, C)
 x_bow = torch.zeros(B, T, C)
 
@@ -225,9 +224,9 @@ assert (mask @ x_bow).shape == (B, T, C)
 # %%
 # version 4: self attention
 
-key, query = nn.Linear(C, HEAD_SIZE, bias=False), nn.Linear(C, HEAD_SIZE, bias=False)
-k, q = key(x), query(x)  # B T H,  B T H
-weights = einsum(k, q, "b seq h, b seq2 h -> b seq seq2")  #: Float[T, "b seq seq"]
+key, query, value = nn.Linear(C, HEAD_SIZE, bias=False), nn.Linear(C, HEAD_SIZE, bias=False), nn.Linear(C, HEAD_SIZE, bias=False)
+k, q, v = key(x), query(x), value(x) # B T H,  B T H, B T H
+weights = einsum(k, q, "b t h, b t2 h -> b t t2")  #: Float[T, "b t t"]
 
 
 def mask_out(x) :
@@ -238,4 +237,5 @@ def mask_out(x) :
 
 masked = mask_out(weights)
 assert torch.allclose(masked[0].sum(),torch.tensor(masked[0].shape[-1]).float())
+out = masked @ v
 # %%
