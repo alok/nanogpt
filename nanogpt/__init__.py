@@ -235,7 +235,24 @@ def mask_out(x) :
     return x.masked_fill(x.tril() == 0, float("-inf")).softmax(dim=-1)
 
 
-masked = mask_out(weights)
-assert torch.allclose(masked[0].sum(),torch.tensor(masked[0].shape[-1]).float())
-out = masked @ v
+#masked = mask_out(weights)
+#assert torch.allclose(masked[0].sum(),torch.tensor(masked[0].shape[-1]).float())
+#out = masked @ v
+# %%
+
+class Head(nn.Module):
+    def __init__(self, head_size: int=HEAD_SIZE):
+        super().__init__()
+        self.key = nn.Linear(C, HEAD_SIZE, bias=False)
+        self.query = nn.Linear(C, HEAD_SIZE, bias=False)
+        self.value = nn.Linear(C, HEAD_SIZE, bias=False)
+
+    def forward(self, x): #: Float[T, 'b t t2']
+        k, q, v = self.key(x), self.query(x), self.value(x)
+        weights = einsum(k,q, "b t h, b t2 h -> b t t2")  #: Float[T, "b t t"]
+        masked = mask_out(weights)
+        out = masked @ v
+        return out
+# %%
+Head()(x)
 # %%
