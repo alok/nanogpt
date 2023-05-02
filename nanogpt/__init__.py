@@ -22,21 +22,16 @@ import torch.nn.functional as F
 from jaxtyping import Float, Integer
 
 random.seed(1_337)
-torch.manual_seed(1_337) # follow karpathy's seed for repro
+torch.manual_seed(1_337)  # follow karpathy's seed for repro
 
 # HACK: jaxtyping doesn't like longtensor, so reassign to plain tensor
 LT = T
-BATCH_SIZE: int = 16
-CTX_LEN: int = 8  # v important that constants be in SCREAMING_SNAKE_CASE
-
-B, T, C = BATCH_SIZE, CTX_LEN, 32 # batch time channel
-# time aka ctx_len aka seq
-HEAD_SIZE: int = 16
-
+BATCH_SIZE: Final[int] = 16  # v important that constants be in SCREAMING_SNAKE_CASE
+CTX_LEN: Final[int] = 8
 EMBED_DIM: Final[int] = 32
-
-## I think error in bigram expects BATCH, CTX but gets BATCH, EMBEDDIM
-## New error F.cross_entropy expects BATCH, vocab and got BATCH, CTX_LEN
+# time aka ctx_len aka seq
+B, T, C = BATCH_SIZE, CTX_LEN, EMBED_DIM
+HEAD_SIZE: Final[int] = EMBED_DIM
 
 INPUT_FILE = Path("input.txt")
 data = urllib.request.urlretrieve(
@@ -49,7 +44,6 @@ chars = sorted(set(raw_data))
 text = "".join(chars)
 
 
-
 # %% Tokenization
 
 
@@ -59,7 +53,6 @@ text = "".join(chars)
 
 VOCAB: Final[bidict.bidict[int, str]] = bidict.bidict(enumerate(chars))
 VOCAB_SIZE: Final[int] = len(VOCAB)
-
 
 
 # %%
@@ -96,8 +89,6 @@ x, y = train[:CTX_LEN], train[1 : CTX_LEN + 1]
 # We use different
 for t in range(CTX_LEN):
     input, target = x[: t + 1], y[t]  # y[t] = x[t+1]
-    print(input, target)
-    # print(decode(input), decode(target))
 
 
 # %%
@@ -117,10 +108,77 @@ xb, yb = get_batch("train")
 for b, t in itertools.product(range(BATCH_SIZE), range(CTX_LEN)):
     ctx, tgt = xb[b, : t + 1], yb[b, t]
 
-# %%
-#bigram(xb, yb)
 
-#bigram.generate(idxs=torch.zeros((1, 1)).long(), max_new_toks=10)
+# %%
+# bigram(xb, yb)
+class Head(nn.Module):
+    def __init__(self, head_size: int = HEAD_SIZE):
+        super().__init__()
+        self.key = nn.Linear(EMBED_DIM, HEAD_SIZE, bias=False)
+        self.query = nn.Linear(EMBED_DIM, HEAD_SIZE, bias=False)
+        self.value = nn.Linear(EMBED_DIM, HEAD_SIZE, bias=False)
+
+    def forward(self, x):  #: Float[T, 'b t t2']
+        def mask_out(x):
+            #    : Float[T, "b t t"]->Float[T, "b t t"]
+            _, T, _ = x.shape
+            return x.masked_fill(x.tril() == 0, float("-inf")).softmax(dim=-1)
+
+        k, q, v = self.key(x), self.query(x), self.value(x)
+        weights = einsum(k, q, "b t h, b t2 h -> b t t2")  #: Float[T, "b t t"]
+        masked = mask_out(weights)
+        out = masked @ v
+        return out
+
+
+class Bigram(nn.Module):
+    def __init__(
+        self, vocab_size: int = VOCAB_SIZE, embed_dim: int = EMBED_DIM
+    ) -> None:
+        super().__init__()
+        self.tok_emb = nn.Embedding(num_embeddings=vocab_size, embedding_dim=embed_dim)
+        self.pos_emb = nn.Embedding(CTX_LEN, embed_dim)
+        self.lang_head = nn.Linear(embed_dim, vocab_size)
+        self.s_attn_head = Head(embed_dim)
+
+        # this can represent a bigram model since the 2d matrix gives "probability of col given row"
+
+    def forward(
+        self, idxs: Integer[LT, "b t"], targets: Integer[LT, "b t"] | None = None
+    ) -> tuple[Tensor, Tensor | None]:
+        """
+        idxs: batch of indexes to represent a sentence.
+        """
+        B, T = idxs.shape
+        x = self.tok_emb(idxs) + self.pos_emb(torch.arange(T))
+        x = self.s_attn_head(x)
+        logits: Float[T, "b t vocab"] = self.lang_head(x)
+        if targets is None:
+            loss = None
+        else:
+            loss = F.cross_entropy(
+                rearrange(logits, "b t vocab -> (b t) vocab"),
+                rearrange(targets, "b t -> (b t)"),
+            )
+        return logits, loss
+
+    def generate(
+        self, idxs: Integer[LT, "b t"], max_new_toks: int
+    ) -> Integer[LT, "b t+max_new_toks"]:
+        for i in range(max_new_toks):
+            logits: Integer[LT, "b t embed"]
+            # crop idxs to avoid messing with positional embedding
+            logits, loss = self(idxs[:, -CTX_LEN:])
+            logits: Integer[LT, "b embed"] = logits[:, -1, :]
+            probs: Integer[LT, "b embed"] = logits.softmax(dim=-1)
+            next_idx: Integer[LT, "b 1"] = probs.multinomial(num_samples=1)
+            idxs: Integer[LT, "b i+1"] = torch.cat([idxs, next_idx], dim=1)
+
+        return idxs
+
+
+bigram = Bigram()
+bigram.generate(idxs=torch.zeros((1, 1)).long(), max_new_toks=10)
 # %%
 optimizer = torch.optim.AdamW(
     bigram.parameters(), lr=1e-3
@@ -157,102 +215,3 @@ def estimate_loss(model):
 
 # %%
 estimate_loss(bigram)
-# %%
-# the mathematical trick in self-attention
-
-x = torch.randn(B, T, C)
-x_bow = torch.zeros(B, T, C)
-
-for b in range(B):
-    for t in range(T):
-        x_bow[b, t] = x[b, : t + 1].mean(dim=0)
-print(x_bow.shape)
-mask = torch.full((T, T), float("-inf")).triu(diagonal=1)
-assert (mask @ x_bow).shape == (B, T, C)
-
-# %%
-# version 4: self attention
-
-key, query, value = nn.Linear(C, HEAD_SIZE, bias=False), nn.Linear(C, HEAD_SIZE, bias=False), nn.Linear(C, HEAD_SIZE, bias=False)
-k, q, v = key(x), query(x), value(x) # B T H,  B T H, B T H
-weights = einsum(k, q, "b t h, b t2 h -> b t t2")  #: Float[T, "b t t"]
-
-
-def mask_out(x) :
-#    : Float[T, "b t t"]->Float[T, "b t t"]
-    _, T, _ = x.shape
-    return x.masked_fill(x.tril() == 0, float("-inf")).softmax(dim=-1)
-
-
-#masked = mask_out(weights)
-#assert torch.allclose(masked[0].sum(),torch.tensor(masked[0].shape[-1]).float())
-#out = masked @ v
-# %%
-
-class Head(nn.Module):
-    def __init__(self, head_size: int=HEAD_SIZE):
-        super().__init__()
-        self.key = nn.Linear(C, HEAD_SIZE, bias=False)
-        self.query = nn.Linear(C, HEAD_SIZE, bias=False)
-        self.value = nn.Linear(C, HEAD_SIZE, bias=False)
-
-    def forward(self, x): #: Float[T, 'b t t2']
-        k, q, v = self.key(x), self.query(x), self.value(x)
-        weights = einsum(k,q, "b t h, b t2 h -> b t t2")  #: Float[T, "b t t"]
-        masked = mask_out(weights)
-        out = masked @ v
-        return out
-# %%
-Head()(x)
-# %%
-
-        
-class Bigram(nn.Module):
-    def __init__(
-        self, vocab_size: int = VOCAB_SIZE, embed_dim: int = EMBED_DIM
-    ) -> None:
-        super().__init__()
-        self.tok_emb = nn.Embedding(
-            num_embeddings=vocab_size, embedding_dim=embed_dim
-        )
-        self.pos_emb = nn.Embedding(CTX_LEN, embed_dim)
-        self.lang_head = nn.Linear(embed_dim, vocab_size)
-        self.s_attn_head = Head(embed_dim)
-
-        self.model: Callable[[Integer[LT, "b t"]], Float[T, "b t"]] = nn.Sequential(
-            self.tok_emb,
-            # Rearrange("b t embed -> b embed t"),
-            self.lang_head,
-        )
-
-        # this can represent a bigram model since the 2d matrix gives "probability of col given row"
-
-    def forward(
-        self, idxs: Integer[LT, "b t"], targets: Integer[LT, "b t"] | None = None
-    ) -> tuple[Tensor, Tensor | None]:
-        """
-        idxs: batch of indexes to represent a sentence.
-        """
-        logits: Float[T, "b t"] = self.model(idxs)
-
-        if targets is None:
-            loss = None
-        else:
-            loss = F.cross_entropy(rearrange(logits, 'b t c -> (b t) c'), rearrange(targets, 'b t -> (b t)'))
-        return logits, loss
-
-    def generate(
-        self, idxs: Integer[LT, "b t"], max_new_toks: int
-    ) -> Integer[LT, "b t+max_new_toks"]:
-        for i in range(max_new_toks):
-            logits: Integer[LT, "b t embed"]
-            logits, loss = self(idxs)
-            logits: Integer[LT, "b embed"] = logits[:, -1, :]
-            probs: Integer[LT, "b embed"] = logits.softmax(dim=-1)
-            next_idx: Integer[LT, "b 1"] = probs.multinomial(num_samples=1)
-            idxs: Integer[LT, "b i+1"] = torch.cat([idxs, next_idx], dim=1)
-
-        return idxs
-
-
-bigram = Bigram(vocab_size=len(chars))
