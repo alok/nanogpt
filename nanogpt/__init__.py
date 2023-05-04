@@ -17,15 +17,16 @@ import torch
 from typing import Literal
 import bidict
 from torch import nn
-from torch import Tensor as T, LongTensor as LT
+from torch import Tensor as TT
 import torch.nn.functional as F
 from jaxtyping import Float, Integer
 
 random.seed(1_337)
 torch.manual_seed(1_337)  # follow karpathy's seed for repro
-
+# TODO: vmap
+# TODO: add multi-head
 # HACK: jaxtyping doesn't like longtensor, so reassign to plain tensor
-LT = T
+LT = TT
 BATCH_SIZE: Final[int] = 16  # v important that constants be in SCREAMING_SNAKE_CASE
 CTX_LEN: Final[int] = 8
 EMBED_DIM: Final[int] = 32
@@ -92,7 +93,7 @@ for t in range(CTX_LEN):
 
 
 # %%
-def get_batch(mode: Literal["train", "val"]) -> tuple[Tensor, Tensor]:
+def get_batch(mode: Literal["train", "val"]) -> tuple[TT, TT]:
     data = train if mode == "train" else val
     random_idxs = torch.randint(high=len(data) - CTX_LEN, size=(BATCH_SIZE,))
     inputs: Integer[LT, "b ctx_len"] = torch.stack(
@@ -118,14 +119,14 @@ class Head(nn.Module):
         self.query = nn.Linear(EMBED_DIM, HEAD_SIZE, bias=False)
         self.value = nn.Linear(EMBED_DIM, HEAD_SIZE, bias=False)
 
-    def forward(self, x):  #: Float[T, 'b t t2']
+    def forward(self, x):  #: Float[TT, 'b t t2']
         def mask_out(x):
-            #    : Float[T, "b t t"]->Float[T, "b t t"]
+            #    : Float[TT, "b t t"]->Float[TT, "b t t"]
             _, T, _ = x.shape
             return x.masked_fill(x.tril() == 0, float("-inf")).softmax(dim=-1)
 
         k, q, v = self.key(x), self.query(x), self.value(x)
-        weights = einsum(k, q, "b t h, b t2 h -> b t t2")  #: Float[T, "b t t"]
+        weights = einsum(k, q, "b t h, b t2 h -> b t t2")  #: Float[TT, "b t t"]
         masked = mask_out(weights)
         out = masked @ v
         return out
@@ -145,14 +146,14 @@ class Bigram(nn.Module):
 
     def forward(
         self, idxs: Integer[LT, "b t"], targets: Integer[LT, "b t"] | None = None
-    ) -> tuple[Tensor, Tensor | None]:
+    ) -> tuple[TT, TT | None]:
         """
         idxs: batch of indexes to represent a sentence.
         """
         B, T = idxs.shape
         x = self.tok_emb(idxs) + self.pos_emb(torch.arange(T))
         x = self.s_attn_head(x)
-        logits: Float[T, "b t vocab"] = self.lang_head(x)
+        logits: Float[TT, "b t vocab"] = self.lang_head(x)
         if targets is None:
             loss = None
         else:
