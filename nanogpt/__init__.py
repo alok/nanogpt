@@ -1,4 +1,5 @@
 # %%
+
 from einops import einsum, pack, unpack
 from einops import rearrange, reduce, repeat
 from einops.layers.torch import Rearrange, Reduce
@@ -119,7 +120,8 @@ class FeedForward(nn.Module):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(embed_dim, embed_dim),
-            nn.ReLU(),
+            nn.GELU(),
+            nn.Linear(embed_dim, embed_dim),
         )
 
     def forward(self, x):
@@ -149,13 +151,22 @@ class Head(nn.Module):
 
 
 class MultiHead(nn.Module):
-    def __init__(self, n_heads: int = N_HEADS, head_size: int = HEAD_SIZE) -> None:
+    def __init__(
+        self,
+        n_heads: int = N_HEADS,
+        head_size: int = HEAD_SIZE,
+        embed_dim: int = EMBED_DIM,
+    ) -> None:
         super().__init__()
         self.n_heads = n_heads
         self.heads = nn.ModuleList([Head(head_size) for _ in range(self.n_heads)])
+        self.proj = nn.Linear(embed_dim, embed_dim)
 
-    def forward(self, x) -> Tensor:
-        return torch.cat([h(x) for h in self.heads], dim=-1)
+    def forward(self, x) -> TT:
+        # TODO replace cat with pack
+        x = torch.cat([h(x) for h in self.heads], dim=-1)
+        x = self.proj(x)
+        return x
 
 
 class ResBlock(nn.Module):
