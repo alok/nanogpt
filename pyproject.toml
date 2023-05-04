@@ -12,6 +12,7 @@ einops = "^0.6.0"
 bidict = "^0.22.1"
 
 jaxtyping = "^0.2.15"
+tqdm = "^4.65.0"
 
 
 [tool.poetry.group.dev.dependencies]

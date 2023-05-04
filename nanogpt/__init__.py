@@ -16,6 +16,7 @@ import urllib.request
 import torch
 from typing import Literal
 import bidict
+from tqdm import trange
 from torch import nn
 from torch import Tensor as TT
 import torch.nn.functional as F
@@ -113,11 +114,11 @@ for b, t in itertools.product(range(BATCH_SIZE), range(CTX_LEN)):
 # %%
 # bigram(xb, yb)
 class Head(nn.Module):
-    def __init__(self, head_size: int = HEAD_SIZE):
+    def __init__(self, head_size: int = HEAD_SIZE, embed_dim: int = EMBED_DIM):
         super().__init__()
-        self.key = nn.Linear(EMBED_DIM, HEAD_SIZE, bias=False)
-        self.query = nn.Linear(EMBED_DIM, HEAD_SIZE, bias=False)
-        self.value = nn.Linear(EMBED_DIM, HEAD_SIZE, bias=False)
+        self.key = nn.Linear(embed_dim, head_size, bias=False)
+        self.query = nn.Linear(embed_dim, head_size, bias=False)
+        self.value = nn.Linear(embed_dim, head_size, bias=False)
 
     def forward(self, x):  #: Float[TT, 'b t t2']
         def mask_out(x):
@@ -126,9 +127,7 @@ class Head(nn.Module):
             return x.masked_fill(x.tril() == 0, float("-inf")).softmax(dim=-1)
 
         k, q, v = self.key(x), self.query(x), self.value(x)
-        weights = einsum(
-            k, q, "b nheads t h, b nheads t2 h -> b nheads t t2"
-        )  #: Float[TT, "b t t"]
+        weights = einsum(k, q, "b t c, b t2 c -> b t t2")  #: Float[TT, "b t t"]
         masked = mask_out(weights)
         out = masked @ v
         return out
@@ -136,8 +135,9 @@ class Head(nn.Module):
 
 class MultiHead(nn.Module):
     def __init__(self, n_heads: int = N_HEADS, head_size: int = HEAD_SIZE) -> None:
+        super().__init__()
         self.n_heads = n_heads
-        self.heads = nn.ModuleList([Head(HEAD_SIZE) for _ in range(self.n_heads)])
+        self.heads = nn.ModuleList([Head(head_size) for _ in range(self.n_heads)])
 
     def forward(self, x) -> Tensor:
         return torch.cat([h(x) for h in self.heads], dim=-1)
@@ -145,13 +145,17 @@ class MultiHead(nn.Module):
 
 class Bigram(nn.Module):
     def __init__(
-        self, vocab_size: int = VOCAB_SIZE, embed_dim: int = EMBED_DIM
+        self,
+        vocab_size: int = VOCAB_SIZE,
+        embed_dim: int = EMBED_DIM,
+        n_heads: int = N_HEADS,
     ) -> None:
         super().__init__()
+        self.n_heads = n_heads
         self.tok_emb = nn.Embedding(num_embeddings=vocab_size, embedding_dim=embed_dim)
         self.pos_emb = nn.Embedding(CTX_LEN, embed_dim)
         self.lang_head = nn.Linear(embed_dim, vocab_size)
-        self.s_attn_head = Head(embed_dim)
+        self.s_attn_heads = MultiHead(self.n_heads, embed_dim // self.n_heads)
 
         # this can represent a bigram model since the 2d matrix gives "probability of col given row"
 
@@ -163,7 +167,7 @@ class Bigram(nn.Module):
         """
         B, T = idxs.shape
         x = self.tok_emb(idxs) + self.pos_emb(torch.arange(T))
-        x = self.s_attn_head(x)
+        x = self.s_attn_heads(x)
         logits: Float[TT, "b t vocab"] = self.lang_head(x)
         if targets is None:
             loss = None
@@ -198,7 +202,7 @@ optimizer = torch.optim.AdamW(
 
 
 # training: call on batches
-for epoch in range(10_000):
+for epoch in trange(10_000):
     xb, yb = get_batch("train")
 
     logits, loss = bigram(idxs=xb, targets=yb)
@@ -212,7 +216,7 @@ print(decode(bigram.generate(idxs=torch.zeros((1, 1)).long(), max_new_toks=100)[
 
 
 # %%
-def estimate_loss(model):
+def estimate_loss(model: nn.Module):
     metrics = {"train": [], "val": []}
 
     with torch.no_grad():
