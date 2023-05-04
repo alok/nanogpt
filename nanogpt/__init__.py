@@ -23,8 +23,8 @@ from jaxtyping import Float, Integer
 
 random.seed(1_337)
 torch.manual_seed(1_337)  # follow karpathy's seed for repro
-# TODO: vmap
 # TODO: add multi-head
+# TODO: vmap
 # HACK: jaxtyping doesn't like longtensor, so reassign to plain tensor
 LT = TT
 BATCH_SIZE: Final[int] = 16  # v important that constants be in SCREAMING_SNAKE_CASE
@@ -33,7 +33,7 @@ EMBED_DIM: Final[int] = 32
 # time aka ctx_len aka seq
 B, T, C = BATCH_SIZE, CTX_LEN, EMBED_DIM
 HEAD_SIZE: Final[int] = EMBED_DIM
-
+N_HEADS: Final[int] = 8
 INPUT_FILE = Path("input.txt")
 data = urllib.request.urlretrieve(
     url="https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt",
@@ -126,10 +126,21 @@ class Head(nn.Module):
             return x.masked_fill(x.tril() == 0, float("-inf")).softmax(dim=-1)
 
         k, q, v = self.key(x), self.query(x), self.value(x)
-        weights = einsum(k, q, "b t h, b t2 h -> b t t2")  #: Float[TT, "b t t"]
+        weights = einsum(
+            k, q, "b nheads t h, b nheads t2 h -> b nheads t t2"
+        )  #: Float[TT, "b t t"]
         masked = mask_out(weights)
         out = masked @ v
         return out
+
+
+class MultiHead(nn.Module):
+    def __init__(self, n_heads: int = N_HEADS, head_size: int = HEAD_SIZE) -> None:
+        self.n_heads = n_heads
+        self.heads = nn.ModuleList([Head(HEAD_SIZE) for _ in range(self.n_heads)])
+
+    def forward(self, x) -> Tensor:
+        return torch.cat([h(x) for h in self.heads], dim=-1)
 
 
 class Bigram(nn.Module):
