@@ -110,6 +110,21 @@ xb, yb = get_batch("train")
 for b, t in itertools.product(range(BATCH_SIZE), range(CTX_LEN)):
     ctx, tgt = xb[b, : t + 1], yb[b, t]
 
+# %%
+# Feedforward module
+
+class FeedForward(nn.Module):
+    def __init__(self, embed_dim: int=EMBED_DIM):
+        super().__init__()
+        self.net=nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            nn.ReLU(),
+        )
+    
+    def forward(self,x):
+        return self.net(x)
+
+
 
 # %%
 # bigram(xb, yb)
@@ -142,6 +157,17 @@ class MultiHead(nn.Module):
     def forward(self, x) -> Tensor:
         return torch.cat([h(x) for h in self.heads], dim=-1)
 
+class Block(nn.Module):
+    def __init__(self, embed_dim: int = EMBED_DIM, n_heads: int = N_HEADS):
+        super().__init__()
+        self.net = nn.Sequential(
+            MultiHead(n_heads, head_size=embed_dim//n_heads),
+            FeedForward(embed_dim),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
 
 class Bigram(nn.Module):
     def __init__(
@@ -155,8 +181,11 @@ class Bigram(nn.Module):
         self.tok_emb = nn.Embedding(num_embeddings=vocab_size, embedding_dim=embed_dim)
         self.pos_emb = nn.Embedding(CTX_LEN, embed_dim)
         self.lang_head = nn.Linear(embed_dim, vocab_size)
-        self.s_attn_heads = MultiHead(self.n_heads, embed_dim // self.n_heads)
-
+        self.blocks = nn.Sequential(
+            *[Block(embed_dim, n_heads) for _ in range(3)]
+        )
+        # self.s_attn_heads = MultiHead(self.n_heads, embed_dim // self.n_heads)
+        # self.feed_forward = FeedForward(embed_dim)
         # this can represent a bigram model since the 2d matrix gives "probability of col given row"
 
     def forward(
@@ -167,7 +196,7 @@ class Bigram(nn.Module):
         """
         B, T = idxs.shape
         x = self.tok_emb(idxs) + self.pos_emb(torch.arange(T))
-        x = self.s_attn_heads(x)
+        x = self.blocks(x)
         logits: Float[TT, "b t vocab"] = self.lang_head(x)
         if targets is None:
             loss = None
