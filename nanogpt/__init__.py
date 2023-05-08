@@ -166,7 +166,7 @@ class MultiHead(nn.Module):
         self.proj = nn.Linear(embed_dim, embed_dim)
 
     def forward(self, x: TT) -> TT:
-        # TODO replace cat with pack
+        # TODO replace cat with pack or just do multiple heads in 1 shot
         x = torch.cat([h(x) for h in self.heads], dim=-1)
         x = self.proj(x)
         return x
@@ -227,6 +227,7 @@ class Bigram(nn.Module):
         self.pos_emb = nn.Embedding(CTX_LEN, embed_dim)
         self.lang_head = nn.Linear(embed_dim, vocab_size)
         self.blocks = nn.Sequential(*[Block(embed_dim, n_heads) for _ in range(3)])
+        self.final_ln = LayerNorm(embed_dim)
         # self.s_attn_heads = MultiHead(self.n_heads, embed_dim // self.n_heads)
         # self.feed_forward = FeedForward(embed_dim)
         # this can represent a bigram model since the 2d matrix gives "probability of col given row"
@@ -241,7 +242,7 @@ class Bigram(nn.Module):
         x = self.tok_emb(idxs) + self.pos_emb(torch.arange(T))
 
         x = self.blocks(x)
-
+        x = self.final_ln(x)
         logits: Float[TT, "b t vocab"] = self.lang_head(x)
 
         if targets is None:
