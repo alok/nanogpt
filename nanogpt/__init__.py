@@ -1,5 +1,6 @@
 # %%
 
+from numbers import Number
 from einops import einsum, pack, unpack
 from einops import rearrange, reduce, repeat
 from einops.layers.torch import Rearrange, Reduce
@@ -22,15 +23,16 @@ from torch import nn
 from torch import Tensor as TT
 import torch.nn.functional as F
 from jaxtyping import Float, Integer
+
 random.seed(1_337)
 torch.manual_seed(1_337)  # follow karpathy's seed for repro
 # TODO: add multi-head
 # TODO: vmap
 # HACK: jaxtyping doesn't like longtensor, so reassign to plain tensor
 LT = TT
-BATCH_SIZE: Final[int] = 16  # v important that constants be in SCREAMING_SNAKE_CASE
-CTX_LEN: Final[int] = 8
-EMBED_DIM: Final[int] = 32
+BATCH_SIZE: Final[int] = 32  # v important that constants be in SCREAMING_SNAKE_CASE
+CTX_LEN: Final[int] = 12
+EMBED_DIM: Final[int] = 512
 # time aka ctx_len aka seq
 B, T, C = BATCH_SIZE, CTX_LEN, EMBED_DIM
 HEAD_SIZE: Final[int] = EMBED_DIM
@@ -118,13 +120,13 @@ class FeedForward(nn.Module):
     def __init__(self, embed_dim: int = EMBED_DIM):
         super().__init__()
         # 4 * multiplier is from original attention paper, where d_model = 512 and d_ff = 2048
-        self.net=nn.Sequential(
-            nn.Linear(embed_dim, 4*embed_dim),
+        self.net = nn.Sequential(
+            nn.Linear(embed_dim, 4 * embed_dim),
             nn.ReLU(),
-            nn.Linear(4*embed_dim, embed_dim)
+            nn.Linear(4 * embed_dim, embed_dim),
         )
 
-    def forward(self, x):
+    def forward(self, x: Tensor) -> Tensor:
         return self.net(x)
 
 
@@ -144,6 +146,7 @@ class Head(nn.Module):
             return x.masked_fill(x.tril() == 0, float("-inf")).softmax(dim=-1)
 
         k, q, v = self.key(x), self.query(x), self.value(x)
+
         weights = einsum(k, q, "b t c, b t2 c -> b t t2")  #: Float[TT, "b t t"]
         masked = mask_out(weights)
         out = masked @ v
@@ -162,11 +165,28 @@ class MultiHead(nn.Module):
         self.heads = nn.ModuleList([Head(head_size) for _ in range(self.n_heads)])
         self.proj = nn.Linear(embed_dim, embed_dim)
 
-    def forward(self, x) -> TT:
+    def forward(self, x: TT) -> TT:
         # TODO replace cat with pack
         x = torch.cat([h(x) for h in self.heads], dim=-1)
         x = self.proj(x)
         return x
+
+
+class LayerNorm(nn.Module):
+    def __init__(self, dims: Sequence[int]) -> None:
+        super().__init__()
+        self.mean_coeff, self.bias_coeff = nn.Parameter(torch.ones(dims)), nn.Parameter(
+            torch.zeros(dims)
+        )
+
+    def forward(self, x: Tensor, eps: Number = 1e-5) -> Tensor:
+        # why keepdim?
+        # Unlike Andrej, we take mean over last (channel) dim
+        return (
+            self.mean_coeff
+            * (x - x.mean(-1, keepdim=True))
+            / torch.sqrt(x.var(-1, keepdim=True) + eps)
+        ) + self.bias_coeff
 
 
 class ResBlock(nn.Module):
@@ -181,22 +201,18 @@ class ResBlock(nn.Module):
 class Block(nn.Module):
     def __init__(self, embed_dim: int = EMBED_DIM, n_heads: int = N_HEADS):
         super().__init__()
-        self.net = nn.Sequential(
-            MultiHead(n_heads, head_size=embed_dim//n_heads),
-            LayerNorm(embed_dim),
-            FeedForward(embed_dim),
-            LayerNorm(embed_dim),
-        )
 
-    def forward(self, x):
-        return self.net(x)
+        self.sa = MultiHead(n_heads, head_size=embed_dim // n_heads)
 
-class LayerNorm(nn.Module):
-    def __init__(self,dims:Sequence[int])->None:
-        self.mean_coeff,self.bias_coeff = nn.Parameter(torch.ones(dims)),nn.Parameter(torch.zeros(dims))
-    def forward(self,x,eps=1e-8):
-        # why keepdim?
-        return self.mean_coeff*(x - x.mean(1))/(x.std(1)+eps).sqrt()+self.bias_coeff
+        self.ffwd = FeedForward(embed_dim)
+
+        self.ln1, self.ln2 = LayerNorm(embed_dim), LayerNorm(embed_dim)
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = x + self.sa(self.ln1(x))
+        x = x + self.ffwd(self.ln2(x))
+        return x
+
 
 class Bigram(nn.Module):
     def __init__(
@@ -223,8 +239,11 @@ class Bigram(nn.Module):
         """
         B, T = idxs.shape
         x = self.tok_emb(idxs) + self.pos_emb(torch.arange(T))
+
         x = self.blocks(x)
+
         logits: Float[TT, "b t vocab"] = self.lang_head(x)
+
         if targets is None:
             loss = None
         else:
@@ -239,10 +258,12 @@ class Bigram(nn.Module):
     ) -> Integer[LT, "b t+max_new_toks"]:
         for i in range(max_new_toks):
             logits: Integer[LT, "b t embed"]
+
             # crop idxs to avoid messing with positional embedding
             logits, loss = self(idxs[:, -CTX_LEN:])
             logits: Integer[LT, "b embed"] = logits[:, -1, :]
             probs: Integer[LT, "b embed"] = logits.softmax(dim=-1)
+
             next_idx: Integer[LT, "b 1"] = probs.multinomial(num_samples=1)
             idxs: Integer[LT, "b i+1"] = torch.cat([idxs, next_idx], dim=1)
 
@@ -287,3 +308,5 @@ def estimate_loss(model: nn.Module):
 
 # %%
 estimate_loss(bigram)
+
+# %%
