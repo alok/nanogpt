@@ -7,7 +7,7 @@ import torch
 import itertools
 import random
 import string
-from typing import Callable, Final
+from typing import Callable, Final, Sequence
 from pathlib import Path
 import math
 import statistics
@@ -22,7 +22,6 @@ from torch import nn
 from torch import Tensor as TT
 import torch.nn.functional as F
 from jaxtyping import Float, Integer
-
 random.seed(1_337)
 torch.manual_seed(1_337)  # follow karpathy's seed for repro
 # TODO: add multi-head
@@ -118,10 +117,11 @@ for b, t in itertools.product(range(BATCH_SIZE), range(CTX_LEN)):
 class FeedForward(nn.Module):
     def __init__(self, embed_dim: int = EMBED_DIM):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim),
-            nn.GELU(),
-            nn.Linear(embed_dim, embed_dim),
+        # 4 * multiplier is from original attention paper, where d_model = 512 and d_ff = 2048
+        self.net=nn.Sequential(
+            nn.Linear(embed_dim, 4*embed_dim),
+            nn.ReLU(),
+            nn.Linear(4*embed_dim, embed_dim)
         )
 
     def forward(self, x):
@@ -182,13 +182,21 @@ class Block(nn.Module):
     def __init__(self, embed_dim: int = EMBED_DIM, n_heads: int = N_HEADS):
         super().__init__()
         self.net = nn.Sequential(
-            ResBlock(MultiHead(n_heads, head_size=embed_dim // n_heads)),
-            ResBlock(FeedForward(embed_dim)),
+            MultiHead(n_heads, head_size=embed_dim//n_heads),
+            LayerNorm(embed_dim),
+            FeedForward(embed_dim),
+            LayerNorm(embed_dim),
         )
 
     def forward(self, x):
         return self.net(x)
 
+class LayerNorm(nn.Module):
+    def __init__(self,dims:Sequence[int])->None:
+        self.mean_coeff,self.bias_coeff = nn.Parameter(torch.ones(dims)),nn.Parameter(torch.zeros(dims))
+    def forward(self,x,eps=1e-8):
+        # why keepdim?
+        return self.mean_coeff*(x - x.mean(1))/(x.std(1)+eps).sqrt()+self.bias_coeff
 
 class Bigram(nn.Module):
     def __init__(
