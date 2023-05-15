@@ -1,28 +1,26 @@
 # %%
-
-from numbers import Number
-from einops import einsum, pack, unpack
-from einops import rearrange, reduce, repeat
-from einops.layers.torch import Rearrange, Reduce
-import torch
 import itertools
-import random
-import string
-from typing import Callable, Final, Sequence
-from pathlib import Path
 import math
+import random
 import statistics
-from torch import Tensor
-from torch import vmap, jit
+import string
 import urllib.request
-import torch
-from typing import Literal
+from dataclasses import dataclass
+from numbers import Number
+from pathlib import Path
+from typing import Callable, Final, Literal, Sequence
+
 import bidict
-from tqdm import trange
-from torch import nn
-from torch import Tensor as TT
+import torch
 import torch.nn.functional as F
+import tyro
+from einops import einsum, pack, rearrange, reduce, repeat, unpack
+from einops.layers.torch import Rearrange, Reduce
 from jaxtyping import Float, Integer
+from torch import Tensor
+from torch import Tensor as TT
+from torch import jit, nn, vmap
+from tqdm import trange
 
 random.seed(1_337)
 torch.manual_seed(1_337)  # follow karpathy's seed for repro
@@ -30,13 +28,29 @@ torch.manual_seed(1_337)  # follow karpathy's seed for repro
 # TODO: vmap
 # HACK: jaxtyping doesn't like longtensor, so reassign to plain tensor
 LT = TT
-BATCH_SIZE: Final[int] = 32  # v important that constants be in SCREAMING_SNAKE_CASE
-CTX_LEN: Final[int] = 12
-EMBED_DIM: Final[int] = 512
+
+
+@dataclass
+class Args:
+    # v important that constants be in SCREAMING_SNAKE_CASE
+    BATCH_SIZE: Final[int] = 32
+    CTX_LEN: Final[int] = 12
+
+    HEAD_SIZE: Final[int] = 64
+    N_HEADS: Final[int] = 8
+    EMBED_DIM: Final[int] = HEAD_SIZE * N_HEADS
+
+    N_LAYERS: Final[int] = 3
+    N_ITERS: Final[int] = 5_000
+    DROP_FRAC: Final[float] = 0.0
+
+
+args = Args()
+
 # time aka ctx_len aka seq
-B, T, C = BATCH_SIZE, CTX_LEN, EMBED_DIM
-HEAD_SIZE: Final[int] = EMBED_DIM
-N_HEADS: Final[int] = 8
+B, T, C = args.BATCH_SIZE, args.CTX_LEN, args.EMBED_DIM
+
+
 INPUT_FILE = Path("input.txt")
 data = urllib.request.urlretrieve(
     url="https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt",
@@ -88,28 +102,28 @@ split = int(0.9 * len(data))
 train, val = data[:split], data[split:]
 
 # %%
-x, y = train[:CTX_LEN], train[1 : CTX_LEN + 1]
+x, y = train[: args.CTX_LEN], train[1 : args.CTX_LEN + 1]
 
 # We use different
-for t in range(CTX_LEN):
+for t in range(args.CTX_LEN):
     input, target = x[: t + 1], y[t]  # y[t] = x[t+1]
 
 
 # %%
 def get_batch(mode: Literal["train", "val"]) -> tuple[TT, TT]:
     data = train if mode == "train" else val
-    random_idxs = torch.randint(high=len(data) - CTX_LEN, size=(BATCH_SIZE,))
+    random_idxs = torch.randint(high=len(data) - args.CTX_LEN, size=(args.BATCH_SIZE,))
     inputs: Integer[LT, "b ctx_len"] = torch.stack(
-        [data[i : i + CTX_LEN] for i in random_idxs]
+        [data[i : i + args.CTX_LEN] for i in random_idxs]
     )
     outputs: Integer[LT, "b ctx_len"] = torch.stack(
-        [data[i + 1 : i + 1 + CTX_LEN] for i in random_idxs]
+        [data[i + 1 : i + 1 + args.CTX_LEN] for i in random_idxs]
     )
     return inputs, outputs
 
 
 xb, yb = get_batch("train")
-for b, t in itertools.product(range(BATCH_SIZE), range(CTX_LEN)):
+for b, t in itertools.product(range(args.BATCH_SIZE), range(args.CTX_LEN)):
     ctx, tgt = xb[b, : t + 1], yb[b, t]
 
 # %%
@@ -117,13 +131,14 @@ for b, t in itertools.product(range(BATCH_SIZE), range(CTX_LEN)):
 
 
 class FeedForward(nn.Module):
-    def __init__(self, embed_dim: int = EMBED_DIM):
+    def __init__(self, embed_dim: int = args.EMBED_DIM):
         super().__init__()
         # 4 * multiplier is from original attention paper, where d_model = 512 and d_ff = 2048
         self.net = nn.Sequential(
             nn.Linear(embed_dim, 4 * embed_dim),
             nn.ReLU(),
             nn.Linear(4 * embed_dim, embed_dim),
+            nn.Dropout(args.DROP_FRAC),
         )
 
     def forward(self, x: Tensor) -> Tensor:
@@ -131,49 +146,59 @@ class FeedForward(nn.Module):
 
 
 # %%
-# bigram(xb, yb)
-class Head(nn.Module):
-    def __init__(self, head_size: int = HEAD_SIZE, embed_dim: int = EMBED_DIM):
-        super().__init__()
-        self.key = nn.Linear(embed_dim, head_size, bias=False)
-        self.query = nn.Linear(embed_dim, head_size, bias=False)
-        self.value = nn.Linear(embed_dim, head_size, bias=False)
-
-    def forward(self, x):  #: Float[TT, 'b t t2']
-        def mask_out(x):
-            #    : Float[TT, "b t t"]->Float[TT, "b t t"]
-            _, T, _ = x.shape
-            return x.masked_fill(x.tril() == 0, float("-inf")).softmax(dim=-1)
-
-        k, q, v = self.key(x), self.query(x), self.value(x)
-
-        weights = einsum(k, q, "b t c, b t2 c -> b t t2")  #: Float[TT, "b t t"]
-        masked = mask_out(weights)
-        out = masked @ v
-        return out
-
-
+# gpt(xb, yb)
 class MultiHead(nn.Module):
     def __init__(
         self,
-        n_heads: int = N_HEADS,
-        head_size: int = HEAD_SIZE,
-        embed_dim: int = EMBED_DIM,
-    ) -> None:
+        head_size: int = args.HEAD_SIZE,
+        embed_dim: int = args.EMBED_DIM,
+        n_heads: int = args.N_HEADS,
+    ):
         super().__init__()
+        self.head_size = embed_dim // n_heads
+        self.embed_dim = embed_dim
         self.n_heads = n_heads
-        self.heads = nn.ModuleList([Head(head_size) for _ in range(self.n_heads)])
+        self.key = nn.Linear(embed_dim, embed_dim)  # B C
+        self.query = nn.Linear(embed_dim, embed_dim)
+        self.value = nn.Linear(embed_dim, embed_dim)
         self.proj = nn.Linear(embed_dim, embed_dim)
+        self.dropout = nn.Dropout(args.DROP_FRAC)
+        self.register_buffer(
+            "mask",
+            rearrange(torch.ones(args.CTX_LEN, args.CTX_LEN), "t t2 -> 1 1 t t2"),
+        )
 
-    def forward(self, x: TT) -> TT:
-        # TODO replace cat with pack or just do multiple heads in 1 shot
-        x = torch.cat([h(x) for h in self.heads], dim=-1)
-        x = self.proj(x)
-        return x
+    def forward(self, x: Tensor) -> Tensor:  #: Float[TT, 'b t t2']
+        def mask_out(x: Tensor) -> Tensor:
+            #    : Float[TT, "b nh t t"]->Float[TT, "b nh t t"]
+            B, nh, T, C = x.shape
+            return x.masked_fill(self.mask[..., :T, :T], float("-inf")).softmax(dim=-1)
+
+        k, q, v = self.key(x), self.query(x), self.value(x)
+        nh, c = self.n_heads, self.embed_dim // self.n_heads
+
+        weights: Tensor = einsum(
+            rearrange(k, "b t (nh c) -> b nh t c", nh=nh),
+            rearrange(q, "b t (nh c) -> b nh t c", nh=nh),
+            "b nh t c, b nh t2 c -> b nh t t2",
+        )  #: Float[TT, "b nh t t"]
+
+        masked = mask_out(weights)
+        masked = self.dropout(masked)
+
+        out: Tensor = einsum(
+            masked,
+            rearrange(v, "b t (nh c) -> b nh t c", nh=nh),
+            "b nh t t, b nh t c -> b nh t c",
+        )
+        out = rearrange(out, "b nh t c -> b t (nh c)")
+
+        out = self.proj(out)
+        return out
 
 
 class LayerNorm(nn.Module):
-    def __init__(self, dims: Sequence[int]) -> None:
+    def __init__(self, dims: int | Sequence[int]) -> None:
         super().__init__()
         self.mean_coeff, self.bias_coeff = nn.Parameter(torch.ones(dims)), nn.Parameter(
             torch.zeros(dims)
@@ -199,14 +224,17 @@ class ResBlock(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, embed_dim: int = EMBED_DIM, n_heads: int = N_HEADS):
+    def __init__(self, embed_dim: int = args.EMBED_DIM, n_heads: int = args.N_HEADS):
         super().__init__()
 
-        self.sa = MultiHead(n_heads, head_size=embed_dim // n_heads)
-
+        self.sa = MultiHead(n_heads=n_heads, head_size=embed_dim // n_heads)
         self.ffwd = FeedForward(embed_dim)
-
         self.ln1, self.ln2 = LayerNorm(embed_dim), LayerNorm(embed_dim)
+        # equivalent:
+        # self.model = nn.Sequential(
+        #     ResBlock(fn=nn.Sequential(self.ln1, self.sa)),
+        #     ResBlock(nn.Sequential(self.ln2, self.ffwd)),
+        # )
 
     def forward(self, x: Tensor) -> Tensor:
         x = x + self.sa(self.ln1(x))
@@ -214,23 +242,22 @@ class Block(nn.Module):
         return x
 
 
-class Bigram(nn.Module):
+class GPT(nn.Module):
     def __init__(
         self,
         vocab_size: int = VOCAB_SIZE,
-        embed_dim: int = EMBED_DIM,
-        n_heads: int = N_HEADS,
+        embed_dim: int = args.EMBED_DIM,
+        n_heads: int = args.N_HEADS,
     ) -> None:
         super().__init__()
         self.n_heads = n_heads
         self.tok_emb = nn.Embedding(num_embeddings=vocab_size, embedding_dim=embed_dim)
-        self.pos_emb = nn.Embedding(CTX_LEN, embed_dim)
+        self.pos_emb = nn.Embedding(args.CTX_LEN, embed_dim)
         self.lang_head = nn.Linear(embed_dim, vocab_size)
-        self.blocks = nn.Sequential(*[Block(embed_dim, n_heads) for _ in range(3)])
+        self.blocks = nn.Sequential(
+            *[Block(embed_dim, n_heads) for _ in range(args.N_LAYERS)]
+        )
         self.final_ln = LayerNorm(embed_dim)
-        # self.s_attn_heads = MultiHead(self.n_heads, embed_dim // self.n_heads)
-        # self.feed_forward = FeedForward(embed_dim)
-        # this can represent a bigram model since the 2d matrix gives "probability of col given row"
 
     def forward(
         self, idxs: Integer[LT, "b t"], targets: Integer[LT, "b t"] | None = None
@@ -261,7 +288,7 @@ class Bigram(nn.Module):
             logits: Integer[LT, "b t embed"]
 
             # crop idxs to avoid messing with positional embedding
-            logits, loss = self(idxs[:, -CTX_LEN:])
+            logits, loss = self(idxs[:, -args.CTX_LEN :])
             logits: Integer[LT, "b embed"] = logits[:, -1, :]
             probs: Integer[LT, "b embed"] = logits.softmax(dim=-1)
 
@@ -271,11 +298,11 @@ class Bigram(nn.Module):
         return idxs
 
 
-bigram = Bigram()
-bigram.generate(idxs=torch.zeros((1, 1)).long(), max_new_toks=10)
+gpt = GPT()
+gpt.generate(idxs=torch.zeros((args.BATCH_SIZE, args.CTX_LEN)).long(), max_new_toks=10)
 # %%
 optimizer = torch.optim.AdamW(
-    bigram.parameters(), lr=1e-3
+    gpt.parameters(), lr=1e-3
 )  # TODO test out 1e-2,1e-3, 3e-4
 
 
@@ -283,14 +310,20 @@ optimizer = torch.optim.AdamW(
 for epoch in trange(10_000):
     xb, yb = get_batch("train")
 
-    logits, loss = bigram(idxs=xb, targets=yb)
+    logits, loss = gpt(idxs=xb, targets=yb)
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
 print(loss.item())
 
 # %%
-print(decode(bigram.generate(idxs=torch.zeros((1, 1)).long(), max_new_toks=100)[0]))
+print(
+    decode(
+        gpt.generate(
+            idxs=torch.zeros((args.BATCH_SIZE, args.CTX_LEN)).long(), max_new_toks=100
+        )[0]
+    )
+)
 
 
 # %%
@@ -308,6 +341,6 @@ def estimate_loss(model: nn.Module):
 
 
 # %%
-estimate_loss(bigram)
+estimate_loss(gpt)
 
 # %%
